@@ -1,0 +1,7 @@
+.idea
+data
+target
+.env
+
+*.lock
+*.iml
