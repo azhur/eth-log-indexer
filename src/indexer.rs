@@ -40,12 +40,6 @@ impl LogIndexer {
         let tip_block = self.get_tip_block().await?;
         let start_block_number = self.get_start_block_number().await?;
 
-        let mut batch_start_block: BlockNumber = start_block_number;
-        let mut batch_end_block: BlockNumber = min(
-            batch_start_block + self.cfg.block_batch_size,
-            tip_block.number,
-        );
-
         tracing::info!(
             "Start block: {:?}, tip block {:?}{:?}",
             start_block_number,
@@ -53,22 +47,29 @@ impl LogIndexer {
             tip_block.number,
         );
 
+        // Nothing to do if we’re already past the tip
+        if start_block_number > tip_block.number {
+            return Ok(());
+        }
+
+        let mut batch_start = start_block_number;
+
         loop {
-            if batch_start_block >= batch_end_block {
+            // end = min(start + size - 1, tip)
+            let batch_end = min(
+                batch_start + self.cfg.block_batch_size - 1,
+                tip_block.number,
+            );
+
+            // process inclusive range [batch_start, batch_end]
+            self.index_batch(batch_start..=batch_end).await?;
+
+            // advance; break when we’ve just processed the tip
+            if batch_end == tip_block.number {
                 break;
             }
 
-            // todo: optimize the historical indexing by using parallel batch transfer fetchers
-            // sqlite doesn't support concurrent writes, we can use concurrent batch fetchers
-            // that sink into a single store writer.
-            self.index_batch(batch_start_block..=batch_end_block)
-                .await?;
-
-            batch_start_block = min(batch_end_block + 1, tip_block.number);
-            batch_end_block = min(
-                batch_start_block + self.cfg.block_batch_size,
-                tip_block.number,
-            );
+            batch_start = batch_end + 1;
         }
 
         tracing::info!("Reached tip block {:?}", tip_block.number);
@@ -111,7 +112,7 @@ impl LogIndexer {
 
     async fn get_start_block_number(&self) -> eyre::Result<BlockNumber> {
         if let Some(last_block) = self.store.get_last_indexed_block().await? {
-            Ok(last_block)
+            Ok(last_block + 1)
         } else {
             tracing::info!("No indexed blocks found, starting from the earliest block");
             Ok(self
@@ -151,9 +152,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const BLOCK_BATCH_SIZE: u64 = 1000;
+    const LATEST_BLOCK_NUMBER: BlockNumber = BlockNumber(21500213);
 
     #[tokio::test]
-    async fn test_index_batch() -> eyre::Result<()> {
+    async fn test_run_once() -> eyre::Result<()> {
+        tracing_subscriber::fmt::init();
+
         let cfg = IndexerConfig {
             contract_address: Address(address!("0x68614481aef06e53d23bbe0772343fb555ac40c8")),
             block_batch_size: BLOCK_BATCH_SIZE,
@@ -161,23 +165,44 @@ mod tests {
             tip_block: TipBlock::Latest,
         };
 
-        let eth_provider = MockEthProvider;
+        let eth_provider = Arc::new(MockEthProvider::new());
         let store = Arc::new(MockStore::new());
 
-        let indexer = LogIndexer::new(cfg, Arc::new(eth_provider), store.clone());
+        let indexer = LogIndexer::new(cfg, eth_provider.clone(), store.clone());
         let _ = indexer.run_once().await?;
 
         let captured_batches = store.captured_batches();
         assert_eq!(captured_batches, expected_captured_batches());
 
+        let captured_ranges = eth_provider.captured_ranges();
+        assert_eq!(captured_ranges, expected_captured_block_ranges());
+
         Ok(())
     }
 
+    fn expected_captured_block_ranges() -> Vec<RangeInclusive<BlockNumber>> {
+        vec![
+            BlockNumber(21497214)..=BlockNumber(21498213),
+            BlockNumber(21498214)..=BlockNumber(21499213),
+            BlockNumber(21499214)..=LATEST_BLOCK_NUMBER,
+        ]
+    }
+
     fn expected_captured_batches() -> Vec<EthTransferBatch> {
-        vec![EthTransferBatch {
-            transfers: expected_transfers(),
-            last_block: BlockNumber(21500213),
-        }]
+        vec![
+            EthTransferBatch {
+                transfers: vec![],
+                last_block: BlockNumber(21498213),
+            },
+            EthTransferBatch {
+                transfers: vec![],
+                last_block: BlockNumber(21499213),
+            },
+            EthTransferBatch {
+                transfers: expected_transfers(),
+                last_block: LATEST_BLOCK_NUMBER,
+            },
+        ]
     }
 
     fn expected_transfers() -> Vec<EthTransfer> {
@@ -220,26 +245,45 @@ mod tests {
         }
 
         async fn get_last_indexed_block(&self) -> eyre::Result<Option<BlockNumber>> {
-            let block = MockEthProvider
-                .get_block_by_id(BlockId::Latest)
-                .await?
-                .ok_or_else(|| eyre::eyre!("Block not found"))?
-                .number
-                - BLOCK_BATCH_SIZE;
+            let block = BlockNumber(21497213);
             Ok(Some(block))
         }
     }
 
-    pub struct MockEthProvider;
+    pub struct MockEthProvider {
+        pub captured_ranges: Mutex<Vec<RangeInclusive<BlockNumber>>>,
+    }
+
+    impl MockEthProvider {
+        pub fn new() -> Self {
+            Self {
+                captured_ranges: Mutex::new(vec![]),
+            }
+        }
+
+        pub fn captured_ranges(&self) -> Vec<RangeInclusive<BlockNumber>> {
+            self.captured_ranges.lock().unwrap().clone()
+        }
+    }
 
     #[async_trait::async_trait]
     impl EthProvider for MockEthProvider {
         async fn fetch_transfer_logs(
             &self,
             _contract_address: Address,
-            _block_range: RangeInclusive<BlockNumber>,
+            block_range: RangeInclusive<BlockNumber>,
         ) -> eyre::Result<Vec<EthTransfer>> {
-            Ok(expected_transfers())
+            let end_range = block_range.end().clone();
+
+            let mut guard = self.captured_ranges.lock().unwrap();
+            guard.push(block_range);
+
+            if end_range == LATEST_BLOCK_NUMBER {
+                // Simulate only last range has logs
+                Ok(expected_transfers())
+            } else {
+                Ok(vec![])
+            }
         }
 
         async fn get_block_by_id(&self, block_id: BlockId) -> eyre::Result<Option<Block>> {
@@ -272,7 +316,7 @@ mod tests {
                     )),
                 })),
                 BlockId::Latest => Ok(Some(Block {
-                    number: BlockNumber(21500213),
+                    number: LATEST_BLOCK_NUMBER,
                     hash: BlockHash(b256!(
                         "09afa661a1c383fe926015a8df4e38d43035e3b33c24167454b9e4ad772312db"
                     )),
