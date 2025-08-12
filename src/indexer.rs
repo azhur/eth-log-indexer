@@ -61,7 +61,9 @@ impl LogIndexer {
                 tip_block.number,
             );
 
-            // process inclusive range [batch_start, batch_end]
+            // todo: optimize the historical indexing by using parallel batch transfer fetchers
+            // sqlite doesn't support concurrent writes, we can use concurrent batch fetchers
+            // that sink into a single store writer.
             self.index_batch(batch_start..=batch_end).await?;
 
             // advance; break when we’ve just processed the tip
