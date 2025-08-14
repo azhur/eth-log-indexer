@@ -1,7 +1,7 @@
 pub mod config;
 mod query;
 
-use crate::domain::{BlockNumber, EthTransferBatch, MetaKey, Metadata};
+use crate::domain::{Block, BlockNumber, EthTransferBatch, MetaKey, Metadata};
 use crate::store::Store;
 use crate::store::sqlite::config::DatabaseConfig;
 use sqlx::Pool;
@@ -28,16 +28,21 @@ impl Store for SqliteStore {
         let size = batch.transfers.len();
 
         let mut tx = self.pool.begin().await?;
-        // todo optimize, combine multiple transfer inserts into a single batch insert
+        // todo optimize, combine multiple inserts into a single batch insert
         for transfer in &batch.transfers {
             query::save_transfer(&mut *tx, transfer).await?;
+        }
+        // todo optimize, combine multiple inserts into a single batch insert
+        for block in &batch.non_final_blocks {
+            query::save_block(&mut *tx, block).await?;
         }
         query::save_metadata(&mut *tx, Metadata::LastIndexedBlock(batch.last_block)).await?;
         tx.commit().await?;
 
         tracing::info!(
-            "Stored {:?} transfer logs, last block {:?}",
+            "Stored {:?} transfer logs, {:?} non-final blocks, last block {:?}",
             size,
+            batch.non_final_blocks.len(),
             batch.last_block
         );
 
@@ -49,6 +54,26 @@ impl Store for SqliteStore {
             .await?
             .map(|val| BlockNumber::from_str(val.as_str()))
             .transpose()
+    }
+
+    async fn get_tip_block(&self) -> eyre::Result<Option<Block>> {
+        query::get_latest_block(&self.pool).await
+    }
+
+    async fn drop_blocks_before(&self, block_number: BlockNumber) -> eyre::Result<()> {
+        query::drop_blocks_before(&self.pool, block_number)
+            .await
+            .map(|_| ())
+    }
+
+    async fn rewind_back(&self, block_number: BlockNumber) -> eyre::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        query::drop_block(&mut *tx, block_number).await?;
+        query::drop_transfers(&mut *tx, block_number).await?;
+        query::save_metadata(&mut *tx, Metadata::LastIndexedBlock(block_number - 1)).await?;
+        tx.commit().await?;
+
+        Ok(())
     }
 }
 
@@ -90,6 +115,7 @@ mod tests {
         let batch = EthTransferBatch {
             transfers: vec![transfer],
             last_block: BlockNumber(123456),
+            non_final_blocks: vec![],
         };
 
         store.save_transfer_batch(batch).await?;
