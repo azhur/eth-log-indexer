@@ -2,7 +2,8 @@ use crate::domain::{Address, Block, BlockId, BlockNumber, EthTransferBatch, TipB
 use crate::eth::provider::EthProvider;
 use crate::store::Store;
 use envconfig::Envconfig;
-use std::cmp::min;
+use itertools::Itertools;
+use std::cmp::{max, min};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ impl LogIndexer {
 
     pub async fn run(&self) -> eyre::Result<()> {
         loop {
-            if let Err(e) = self.run_once().await {
+            if let Err(e) = self.tick().await {
                 tracing::error!("Error running indexer: {:?}", e);
             }
 
@@ -36,50 +37,111 @@ impl LogIndexer {
         }
     }
 
-    pub async fn run_once(&self) -> eyre::Result<()> {
-        let tip_block = self.get_tip_block().await?;
-        let start_block_number = self.get_start_block_number().await?;
+    pub async fn tick(&self) -> eyre::Result<()> {
+        let reconciled_tip = self.reconcile_tip().await?;
+
+        let tip_block = self.get_provider_tip_block().await?;
+        let tip_block_number = tip_block.number;
+        let start_block_number = self.get_start_block_number(reconciled_tip).await?;
+        let finalized_block_number = self
+            .provider
+            .get_block_by_id(BlockId::Finalized)
+            .await?
+            .map(|n| n.number);
 
         tracing::info!(
-            "Start block: {:?}, tip block {:?}{:?}",
+            "Start block: {:?}, finalized block {:?}, provider tip block {:?}{:?}",
             start_block_number,
+            finalized_block_number,
             self.cfg.tip_block,
-            tip_block.number,
+            tip_block_number,
         );
 
         // Nothing to do if we’re already past the tip
-        if start_block_number > tip_block.number {
+        if start_block_number > tip_block_number {
             return Ok(());
         }
 
         let mut batch_start = start_block_number;
 
         loop {
-            // end = min(start + size - 1, tip)
             let batch_end = min(
                 batch_start + self.cfg.block_batch_size - 1,
-                tip_block.number,
+                tip_block_number,
             );
 
             // todo: optimize the historical indexing by using parallel batch transfer fetchers
             // sqlite doesn't support concurrent writes, we can use concurrent batch fetchers
             // that sink into a single store writer.
-            self.index_batch(batch_start..=batch_end).await?;
+            self.index_batch(batch_start..=batch_end, finalized_block_number)
+                .await?;
 
             // advance; break when we’ve just processed the tip
-            if batch_end == tip_block.number {
+            if batch_end == tip_block_number {
                 break;
             }
 
             batch_start = batch_end + 1;
         }
 
-        tracing::info!("Reached tip block {:?}", tip_block.number);
+        if let Some(final_block_number) = finalized_block_number {
+            // cleanup the finalized blocks, we are interested only in non-finalized blocks to handle reorgs
+            self.store
+                .drop_blocks_before(final_block_number + 1)
+                .await?;
+        }
+
+        tracing::info!("Reached tip block {:?}", tip_block_number);
 
         Ok(())
     }
 
-    async fn index_batch(&self, range: RangeInclusive<BlockNumber>) -> eyre::Result<()> {
+    /// Handles reorgs by reconciling local tip hash vs corresponding provider block hash and rewinding back until hashes for local block and provider block match.
+    /// We store locally only non-finalized blocks so rewinding back is possible until all non-finalized blocks are exhausted.
+    /// Ideally reorgs are not expected often and not expected to be very deep so this approach should be fine in most cases.
+    /// returns reorg-free local tip or None
+    async fn reconcile_tip(&self) -> eyre::Result<Option<BlockNumber>> {
+        // finalized blocks are reorg-free so no need to check the local tip
+        if self.cfg.tip_block == TipBlock::Finalized {
+            return Ok(None);
+        }
+
+        loop {
+            let Some(local_tip) = self.store.get_tip_block().await? else {
+                break;
+            };
+
+            let Some(remote_tip) = self
+                .provider
+                .get_block_by_id(BlockId::Number(local_tip.number))
+                .await?
+            else {
+                tracing::warn!(
+                    "Remote block not found at {:?}, rewinding back by 1",
+                    local_tip.number
+                );
+                self.store.rewind_back(local_tip.number).await?;
+                continue;
+            };
+
+            if local_tip != remote_tip {
+                tracing::info!(
+                    "Reorg detected at {:?}, rewinding back by 1",
+                    local_tip.number
+                );
+                self.store.rewind_back(local_tip.number).await?;
+            } else {
+                return Ok(Some(local_tip.number));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn index_batch(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+        finalized_block: Option<BlockNumber>,
+    ) -> eyre::Result<()> {
         let last_block = *range.end();
 
         // todo handle provider 'max block range' and 'max return results per range' limits
@@ -92,18 +154,43 @@ impl LogIndexer {
         // sample error for 'max return results per range': 'code: -32602 message: query exceeds max results 20000, retry with the range 23004221-23004288'
         let transfers = self
             .provider
-            .fetch_transfer_logs(self.cfg.contract_address, range)
+            .fetch_transfer_logs(self.cfg.contract_address, range.clone())
             .await?;
+
+        // we are interested in non-finalized blocks to handle reorgs
+        let non_finalized_blocks = finalized_block
+            .filter(|&finalized| finalized < last_block)
+            .map(|finalized| {
+                (max(finalized.0 + 1, range.start().0)..=last_block.0)
+                    .map(BlockNumber)
+                    .collect_vec()
+            })
+            .unwrap_or_default();
+
+        let non_final_blocks = self.get_provider_blocks(&non_finalized_blocks).await?;
 
         let batch = EthTransferBatch {
             transfers,
             last_block,
+            non_final_blocks,
         };
 
         self.store.save_transfer_batch(batch).await
     }
 
-    async fn get_tip_block(&self) -> eyre::Result<Block> {
+    async fn get_provider_blocks(&self, numbers: &[BlockNumber]) -> eyre::Result<Vec<Block>> {
+        let mut blocks = vec![];
+        // todo parallelize
+        for num in numbers {
+            let block = self.provider.get_block_by_id(BlockId::Number(*num)).await?;
+            if let Some(block) = block {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
+    }
+
+    async fn get_provider_tip_block(&self) -> eyre::Result<Block> {
         let block = self
             .provider
             .get_block_by_id(self.cfg.tip_block.into())
@@ -112,7 +199,14 @@ impl LogIndexer {
         Ok(block)
     }
 
-    async fn get_start_block_number(&self) -> eyre::Result<BlockNumber> {
+    async fn get_start_block_number(
+        &self,
+        reconciled_tip: Option<BlockNumber>,
+    ) -> eyre::Result<BlockNumber> {
+        if let Some(reconciled_tip) = reconciled_tip {
+            return Ok(reconciled_tip + 1);
+        }
+
         if let Some(last_block) = self.store.get_last_indexed_block().await? {
             Ok(last_block + 1)
         } else {
@@ -171,7 +265,7 @@ mod tests {
         let store = Arc::new(MockStore::new());
 
         let indexer = LogIndexer::new(cfg, eth_provider.clone(), store.clone());
-        let _ = indexer.run_once().await?;
+        let _ = indexer.tick().await?;
 
         let captured_batches = store.captured_batches();
         assert_eq!(captured_batches, expected_captured_batches());
@@ -195,14 +289,17 @@ mod tests {
             EthTransferBatch {
                 transfers: vec![],
                 last_block: BlockNumber(21498213),
+                non_final_blocks: vec![],
             },
             EthTransferBatch {
                 transfers: vec![],
                 last_block: BlockNumber(21499213),
+                non_final_blocks: vec![],
             },
             EthTransferBatch {
                 transfers: expected_transfers(),
                 last_block: LATEST_BLOCK_NUMBER,
+                non_final_blocks: vec![],
             },
         ]
     }
@@ -249,6 +346,18 @@ mod tests {
         async fn get_last_indexed_block(&self) -> eyre::Result<Option<BlockNumber>> {
             let block = BlockNumber(21497213);
             Ok(Some(block))
+        }
+
+        async fn get_tip_block(&self) -> eyre::Result<Option<Block>> {
+            Ok(None)
+        }
+
+        async fn drop_blocks_before(&self, _block_number: BlockNumber) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn rewind_back(&self, _block_number: BlockNumber) -> eyre::Result<()> {
+            Ok(())
         }
     }
 
@@ -326,6 +435,7 @@ mod tests {
                         "ac5e1f4e9db5a1ab1b8456862d54f9ed74c5fd6a04a5c61b6805af13b322895d"
                     )),
                 })),
+                BlockId::Number(_) => Ok(None),
             }
         }
     }

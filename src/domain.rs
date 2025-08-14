@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::string::ToString;
 
 /// Domain (model) objects used across different layers of the application.
+/// A more idiomatic way would be each layer to have its own domain
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct BlockNumber(pub u64);
@@ -50,6 +51,7 @@ pub struct EthTransfer {
 pub struct EthTransferBatch {
     pub transfers: Vec<EthTransfer>,
     pub last_block: BlockNumber,
+    pub non_final_blocks: Vec<Block>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -89,9 +91,10 @@ pub enum BlockId {
     Finalized,
     Safe,
     Latest,
+    Number(BlockNumber),
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum TipBlock {
     /// the last finalized block, theoretically immutable and reorg-free
     Finalized,
@@ -131,6 +134,7 @@ impl From<BlockId> for alloy::eips::BlockId {
             BlockId::Finalized => alloy::eips::BlockId::Number(BlockNumberOrTag::Finalized),
             BlockId::Safe => alloy::eips::BlockId::Number(BlockNumberOrTag::Safe),
             BlockId::Latest => alloy::eips::BlockId::Number(BlockNumberOrTag::Latest),
+            BlockId::Number(num) => alloy::eips::BlockId::Number(BlockNumberOrTag::Number(num.0)),
         }
     }
 }
@@ -182,6 +186,12 @@ impl FromStr for Address {
 impl From<Vec<u8>> for TxHash {
     fn from(bytes: Vec<u8>) -> Self {
         TxHash(B256::from_slice(&bytes))
+    }
+}
+
+impl From<Vec<u8>> for BlockHash {
+    fn from(bytes: Vec<u8>) -> Self {
+        BlockHash(B256::from_slice(&bytes))
     }
 }
 
@@ -264,6 +274,11 @@ impl Type<Sqlite> for BlockTimestamp {
 impl Type<Sqlite> for LogIndex {
     fn type_info() -> SqliteTypeInfo {
         <i64 as Type<Sqlite>>::type_info()
+    }
+}
+impl Type<Sqlite> for BlockHash {
+    fn type_info() -> SqliteTypeInfo {
+        <Vec<u8> as Type<Sqlite>>::type_info()
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::domain::{EthTransfer, MetaKey, Metadata};
+use crate::domain::{Block, BlockNumber, EthTransfer, MetaKey, Metadata};
 use sqlx::{Executor, Sqlite};
 
 #[allow(unused)]
@@ -70,6 +70,73 @@ where
         .await?;
 
     Ok(row.map(|r| r.value))
+}
+
+pub async fn drop_transfers<'c, E>(executor: E, block_number: BlockNumber) -> eyre::Result<u64>
+where
+    E: Executor<'c, Database = Sqlite>,
+{
+    let rows = sqlx::query!("DELETE FROM transfers WHERE block_number = ?", block_number)
+        .execute(executor)
+        .await?
+        .rows_affected();
+
+    Ok(rows)
+}
+
+pub async fn save_block<'c, E>(executor: E, block: &Block) -> eyre::Result<()>
+where
+    E: Executor<'c, Database = Sqlite>,
+{
+    let hash = &block.hash;
+    let parent_hash = &block.parent_hash;
+    sqlx::query!(
+        "INSERT INTO blocks (
+            number, hash, parent_hash
+        ) VALUES (?, ?, ?) ON CONFLICT (number) DO NOTHING",
+        block.number,
+        hash,
+        parent_hash,
+    )
+    .execute(executor)
+    .await
+    .map(|_| ())
+    .map_err(Into::into)
+}
+
+pub async fn get_latest_block<'c, E>(executor: E) -> eyre::Result<Option<Block>>
+where
+    E: Executor<'c, Database = Sqlite>,
+{
+    let row = sqlx::query_as!(Block, "SELECT * FROM blocks ORDER BY number DESC LIMIT 1")
+        .fetch_optional(executor)
+        .await?;
+
+    Ok(row)
+}
+
+pub async fn drop_blocks_before<'c, E>(executor: E, block_number: BlockNumber) -> eyre::Result<u64>
+where
+    E: Executor<'c, Database = Sqlite>,
+{
+    let rows = sqlx::query!("DELETE FROM blocks WHERE number < ?", block_number)
+        .execute(executor)
+        .await?
+        .rows_affected();
+
+    Ok(rows)
+}
+
+pub async fn drop_block<'c, E>(executor: E, block_number: BlockNumber) -> eyre::Result<u64>
+where
+    E: Executor<'c, Database = Sqlite>,
+{
+    let rows = sqlx::query!("DELETE FROM blocks WHERE number = ?", block_number)
+        .execute(executor)
+        .await?
+        .rows_affected();
+
+    Ok(rows)
 }
 
 #[cfg(test)]
